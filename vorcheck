@@ -1,18 +1,19 @@
 #!/bin/python
-
-import platform,urllib2,json,re,sys,tempfile,os,subprocess,shutil
+try:
+    from urllib.request import urlopen
+except:
+    from urllib2 import urlopen
+import platform,json,re,sys,tempfile,os,subprocess,shutil,stat
 from distutils.version import LooseVersion
 
-VERSION = 0.0
+VERSION = 0.1
 COMPURL = "https://packages.vormetric.com/pub/cte_compatibility_matrix.json"
 
-'''
-Gather and set OS Info ------------------------------
-'''
 DistroInfo = platform.linux_distribution()
 if DistroInfo[0] == "CentOS Linux":
     DISTRO = "RHEL"
     DISTRO_VER = re.match('\d+\.\d+', DistroInfo[1]).group()
+    DISTRO_VER_MAJOR = re.match('\d+', DistroInfo[1]).group()
 elif DistroInfo[0] == "Ubuntu":
     DISTRO = "UBUNTU"
 
@@ -20,23 +21,36 @@ OS = "{0}{1}".format(DISTRO,DISTRO_VER)
 CURRENT_KERNEL = platform.release()
 HOSTNAME = platform.node()
 
-'''
------------------------------------------------------
-'''
+AGENT_URL = {
+    "RHEL6" : "http://a.svc.armor.com/downloads/Vormetric/FS/vee-fs-latest-rh6-x86_64.bin",
+    "RHEL7" : "http://a.svc.armor.com/downloads/Vormetric/FS/vee-fs-latest-rh7-x86_64.bin",           
+    "UBUNTU16.04" : "http://a.svc.armor.com/downloads/Vormetric/FS/vee-fs-latest-ubuntu16-x86_64.bin",
+    "UBUNTU18.04" : "http://a.svc.armor.com/downloads/Vormetric/FS/vee-fs-latest-ubuntu18-x86_64.bin",
+            }
+
+def CheckSupportedDistro():
+    '''
+    Check that the distro found is supported
+    '''
+
+    if AGENT_URL.get("{}{}".format(DISTRO,DISTRO_VER_MAJOR)):
+        return True
+    else:
+        return False
 
 def CheckArmorAgent():
     '''
     Returns the latest agent version number in the Armor repo
     '''
+    AgentVersion = None
     try:
         tempdir = tempfile.mkdtemp()
         AgentFile = "{0}/vee-fs.bin".format(tempdir)
-        url = "http://a.svc.armor.com/downloads/Vormetric/FS/vee-fs-latest-rh7-x86_64.bin"
-        r = urllib2.urlopen(url)
+        url = AGENT_URL.get("{}{}".format(DISTRO,DISTRO_VER_MAJOR))
+        r = urlopen(url)
         with open(AgentFile, 'wb') as agent:
             agent.write(r.read())
-
-        os.chmod(AgentFile, 0700)
+        os.chmod(AgentFile, stat.S_IRWXU)
         with open(os.devnull, 'w') as DEVNULL:
             subprocess.call([AgentFile, "-e"], stdout=DEVNULL, cwd=tempdir)
 
@@ -57,9 +71,9 @@ def DownloadCompMatix():
     Downloads the latest compatibility matrix from vormetric and stores as a dict/list json-like structure
     '''
     try:
-        response = urllib2.urlopen(COMPURL, timeout = 5) 
+        response = urlopen(COMPURL, timeout = 5) 
         CompData = json.loads(response.read())
-    except urllib2.URLError, e:
+    except urllib2.URLError:
         print("\nERROR: unable to access compatibility matix, please paste contents of {0} followed by ctrl+d twice\n".format(COMPURL))
         msg = sys.stdin.readlines()
         st = ''
@@ -85,7 +99,7 @@ def KernelUpgradeCheckYum():
 
 def VeeFsVersionRPM():
     '''
-    Returns vee-fs version via RPM
+    Returns Current vee-fs version via RPM
     '''
     import yum
     yb = yum.YumBase()
@@ -104,8 +118,8 @@ def FindAgentSupport(CompData, NewKernel):
     '''
     global DistroInfo
     DistroInfo = []
-    global KernelSupport
-    KernelSupport = {}
+    global VeeFsLatestKernel
+    VeeFsLatestKernel = ""
     for i in CompData["MAPPING"]:
         if i["OS"] == OS:
             DistroInfo = i["KERNEL"]
@@ -113,22 +127,33 @@ def FindAgentSupport(CompData, NewKernel):
 
     for x in DistroInfo:
         if x["NUM"] == NewKernel:
-            KernelSupport = x["START"]
+            VeeFsLatestKernel = x["START"]
             break
 
 if __name__ == "__main__":
     
     
     print("\nVORMTRIC UPGRADE CHECKER, VERSION {0}\n\n".format(VERSION))
+    if not CheckSupportedDistro():
+        print("determined distro: {}{} not suported".format(DISTRO,DISTRO_VER_MAJOR))
+        sys.exit()
+
     if DISTRO == "RHEL":
         NewKernel = KernelUpgradeCheckYum()
-        VeeFsVersion = VeeFsVersionRPM()
+        CurrentVeeFsVersion = VeeFsVersionRPM()
+
+# Output summary determines one of the following:
+# No new kernel available
+# New kernel does not have a compatible agent
+# New kernel has compatible agent, but not in Armor Repo
+# New kernel has compatible agent and is in Armor Repo
+# New kernel compatible with current installed Agent
 
     if NewKernel:
         CompData = DownloadCompMatix()        
         FindAgentSupport(CompData, NewKernel)
-        ArmorAgentVer = CheckArmorAgent()
-            
+        VeeFsArmorRepo = CheckArmorAgent()
+        print("-------------------------------------------------------------------------")    
         print("Hostname:\t\t{}".format(HOSTNAME))
         print("Distribution:\t\t{}".format(DISTRO))
         print("Distro Version:\t\t{}".format(DISTRO_VER))
@@ -138,16 +163,30 @@ if __name__ == "__main__":
         print("Latest Kernel avail:\t{}".format(NewKernel))
 
         print("")
-        print("Installed vee-fs version:\t\t{}".format(VeeFsVersion))
-        print("Min vee-fs Version for Latest Kernel:\t{}".format(KernelSupport))
-        print("Latest vee-fs in Armor Repo:\t\t{}".format(ArmorAgentVer))
+        print("Installed vee-fs version:\t\t{}".format(CurrentVeeFsVersion))
+        print("Min vee-fs Version for Latest Kernel:\t{}".format(VeeFsLatestKernel))
+        print("Latest vee-fs in Armor Repo:\t\t{}".format(VeeFsArmorRepo))
+        print("-------------------------------------------------------------------------")    
 
-        if not KernelSupport:
-            print("\nNo vee-fs agent available for latest kernel, contact Thales for an ETA\n")
+        print("\n-------------------------------------------------------------------------")    
+        print("Upgrade Status Summary:\n")
+        # New kernel does not have a compatible agent
+        if not VeeFsLatestKernel:
+            print("No vee-fs agent available for latest kernel, contact Thales for an ETA\n")
             print("Latest kernel supported:\t{}".format(DistroInfo[-1]["NUM"]))
             print("Via Agent:\t\t\t{}".format(DistroInfo[-1]["START"]))
-        elif LooseVersion(VeeFsVersion) >= LooseVersion(KernelSupport):
-            print("\nInstalled vee-fs compatible with latest kernel, safe to upgrade kernel only")
+        # New kernel compatible with current installed Agent
+        elif LooseVersion(CurrentVeeFsVersion) >= LooseVersion(VeeFsLatestKernel):
+            print("Installed vee-fs compatible with latest kernel, safe to upgrade kernel only")
     
+        # New kernel has compatible agent, but not in Armor Repo
+        elif LooseVersion(VeeFsLatestKernel) > LooseVersion(VeeFsArmorRepo):
+            print("New Agent compatible with latest kernel available, but not in Armor repo, update Armor repo first")
+        # New kernel has compatible agent and is in Armor Repo
+        elif LooseVersion(VeeFsLatestKernel) <= LooseVersion(VeeFsArmorRepo):
+            print("New agent compatible with latest kernel available in Armor repo, update kernel and vee-fs package")
+        print("-------------------------------------------------------------------------\n")
     else:
-        print("\nNo new kernel available")
+        # No new kernel available
+        print("\nNo new kernel available, all other checks not executed")
+    print("\nIf you are at anytime unsure about agent compatibility, check the agent compatibility matrix, here: https://thalesdocs.com/ctp/cte/cte-cm/index.html\n")
